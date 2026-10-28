@@ -1,0 +1,700 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+partio.py — Lectura/escritura de particiones UFS sobre una sola sesion firehose.
+
+Usa la API en proceso de edl (bkerler 3.62): un unico upload del loader por
+Sahara y luego todos los comandos viajan por la misma conexion USB. Las
+escrituras usan la primitiva <patch> (1-8 bytes/comando), que elude la
+allowlist LBA que bloquea <program> en la ventana protegida (hallazgo F1a).
+
+Subcomandos:
+  info                                 geometria/UFS
+  parts [--lun N]                      tabla GPT: LBA, tamano, marca de ventana
+  read <part> <archivo>                volcado nativo de particion (rapido)
+  read-lba <lun> <lba> <sectores> <f>  volcado crudo por LBA
+  write <part> <imagen> [opciones]     escritura diff-based via patch (+backup)
+  write-lba <lun> <lba> <imagen>       igual, sobre un rango LBA explicito
+  restore <part> <backup>              reescribe un backup previo (misma ruta write)
+  peek <part> <offset> <bytes>         lectura hex de un rango dentro de un sector
+  poke <part> <offset> <hex>           escritura hex quirurgica (backup del sector)
+
+Seguridad por defecto:
+  - write/restore/poke sin --yes solo calculan el plan (modo dry-run) y dejan
+    el backup hecho; no escriben nada.
+  - backup completo de la particion (o del sector) antes de tocar nada.
+  - --force obligatorio para particiones de cadena de arranque/modem/EFS.
+  - verificacion por relectura de todo sector modificado.
+  - manifiesto JSON con geometria, hashes y LBAs tocados para restaurar.
+
+Reglas del equipo (SM-F926U): --memory=ufs, LUN 0, sector 4096, no mover el
+cable ni apagar durante una escritura.
+"""
+import argparse, binascii, datetime, hashlib, json, os, re, struct, sys, time
+
+# Ventana donde <program> recibe NAK del gate LBA 0x14827d40 (analisis estatico,
+# confirmado en HW). patch escribe igual; la marca es informativa.
+PROT_LO, PROT_HI = 0x109, 0x39CDFF
+MAX_PATCH = 8
+READ_CHUNK = 64          # sectores por comando read (256 KiB con ss=4096)
+DEFAULT_MAX_PATCHES = 100_000   # frena trabajos inviables salvo --max-patches explicito
+DANGER = ("xbl", "sbl", "tz", "hyp", "modem", "nhlos", "dsp", "efs", "persist",
+          "fsg", "fsc", "devcfg", "keymaster", "keyrefuge", "uefi", "aop", "qupfw",
+          "rpmh", "cpucp", "abl", "imagefv", "quefw", "ssd", "keystore", "spu",
+          "metadata", "vbmeta", "dtbo", "vendor_boot", "bota", "sec_efs")
+BACKUP_DIR = "partio_backups"
+
+# Los args se derivan del PROPIO docopt del edl.py de la maquina (ver
+# EdlSession): asi nunca falta una clave que una version concreta requiera
+# (p.ej. --pagesperblock), y solo se sobreescriben los valores de sesion.
+
+
+class EdlSession:
+    """Una sola sesion Sahara/firehose; expone el objeto Firehose (fh)."""
+    def __init__(self, edl_dir, loader, memory="ufs", lun=0, debug=False):
+        edl_dir = os.path.abspath(edl_dir)
+        if edl_dir not in sys.path:
+            sys.path.insert(0, edl_dir)
+        # edl.py llama docopt() en tiempo de importacion: le damos un argv valido.
+        sys.argv = [os.path.join(edl_dir, "edl.py"), "nop"]
+        import edl  # noqa: E402
+        from docopt import docopt  # noqa: E402
+        # Args completos generados por el docopt de ESTA version de edl; asi
+        # existen todas las claves (--pagesperblock, --sectorsize, etc.) y solo
+        # se sobreescriben los parametros de la sesion.
+        args = docopt(edl.__doc__, argv=["nop"])
+        args.update({
+            "--loader": os.path.abspath(loader),
+            "--memory": memory,
+            "--lun": str(lun),
+            "--maxpayload": "0x100000",
+            "--vid": "-1", "--pid": "-1",
+            "--debugmode": debug,
+            "--skipstorageinit": False, "--skipwrite": False,
+            "--skipresponse": False,
+            "--serial": False, "--portname": None, "--serial_number": None,
+        })
+        if args.get("--tcpport") is None:
+            args["--tcpport"] = "1340"
+        # Normalizacion defensiva de claves GPT (algunas versiones las dan en None)
+        for k in ("--gpt-num-part-entries", "--gpt-part-entry-size",
+                  "--gpt-part-entry-start-lba"):
+            if not args.get(k):
+                args[k] = "0"
+        self.args = args
+        self.edl = edl.main(args)              # imported=True: run() no despacha
+        rc = self.edl.run()                    # sube loader, configure, conecta
+        if not self.edl.fh or not getattr(self.edl.fh, "connected", False):
+            raise RuntimeError(f"no se pudo establecer la sesion firehose (rc={rc})")
+        self.fh = self.edl.fh.firehose
+        self.cfg = self.fh.cfg
+        self.sector_size = self.cfg.SECTOR_SIZE_IN_BYTES or 4096
+        self.lun = lun
+
+    def close(self):
+        try:
+            self.edl.exit(0, cdc_close=True)
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+
+
+# ---------------------------------------------------------------- logica pura
+def diff_runs(old: bytes, new: bytes):
+    """Rachas maximales de bytes distintos -> [(offset, bytes_nuevos), ...]."""
+    assert len(old) == len(new)
+    runs, i, n = [], 0, len(old)
+    while i < n:
+        if old[i] != new[i]:
+            j = i
+            while j < n and old[j] != new[j]:
+                j += 1
+            runs.append((i, new[i:j]))
+            i = j
+        else:
+            i += 1
+    return runs
+
+
+def runs_to_patches(runs):
+    """Trocea rachas en patches de 1..8 bytes; value en little-endian."""
+    out = []
+    for offset, data in runs:
+        for k in range(0, len(data), MAX_PATCH):
+            chunk = data[k:k + MAX_PATCH]
+            out.append((offset + k, len(chunk), int.from_bytes(chunk, "little")))
+    return out
+
+
+def plan_sector(old: bytes, new: bytes):
+    """Devuelve lista de patches para un sector, o None si es identico."""
+    if old == new:
+        return None
+    return runs_to_patches(diff_runs(old, new))
+
+
+def human(n):
+    for u in ("B", "KiB", "MiB", "GiB"):
+        if n < 1024 or u == "GiB":
+            return f"{n:.1f} {u}" if u != "B" else f"{n} B"
+        n /= 1024
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for blk in iter(lambda: f.read(1 << 20), b""):
+            h.update(blk)
+    return h.hexdigest()
+
+
+def is_danger(name):
+    low = name.lower()
+    return any(tok in low for tok in DANGER)
+
+
+def in_protected_window(lba):
+    return PROT_LO <= lba <= PROT_HI
+
+
+# ---------------------------------------------------------------- operaciones
+def cmd_info(s: EdlSession, _a):
+    info, raw = s.fh.cmd_getstorageinfo()
+    print(raw if isinstance(raw, str) else info)
+    print(f"Sector size en sesion: {s.sector_size} bytes | MemoryName: {s.cfg.MemoryName}")
+
+
+def cmd_parts(s: EdlSession, a):
+    data, gpt = s.fh.get_gpt(a.lun, 0, 0, 0)
+    if gpt is None:
+        sys.exit("[-] no se pudo leer la GPT de ese LUN")
+    print(f"{'particion':<24}{'LUN':>4}{'inicio(LBA)':>13}{'sectores':>11}"
+          f"{'tamano':>10}  ventana_program")
+    for name, p in gpt.partentries.items():
+        mark = "BLOQUEADO" if (a.lun == 0 and in_protected_window(p.sector)) else "libre"
+        print(f"{name:<24}{a.lun:>4}{p.sector:>13}{p.sectors:>11}"
+              f"{human(p.sectors * s.sector_size):>10}  {mark}")
+    print("\n('BLOQUEADO' = <program> recibe NAK ahi; la ruta patch de esta "
+          "herramienta escribe de todos modos: F1a)")
+
+
+def _detect(s: EdlSession, name):
+    res = s.fh.detect_partition(s.args, name)
+    # Exito: [True, lun, partentry] (o 4 elementos con send_full).
+    if res and res[0]:
+        return res[1], res[2]
+    # No encontrada: [False, {"Lun0": [nombres], ...}] (solo 2 elementos)
+    fpartitions = res[1] if len(res) > 1 else {}
+    avail = ", ".join(sorted({n for lst in fpartitions.values() for n in lst}))
+    sys.exit(f"[-] particion no encontrada: {name!r}\n    disponibles: {avail}")
+
+
+def _resolve_part_image(partition, image):
+    """Tolera el orden invertido 'write <imagen> <particion>' (estilo fastboot)."""
+    if os.path.isfile(partition) and not os.path.isfile(image):
+        print(f"[*] orden invertido detectado; interpreto particion={image!r}, "
+              f"imagen={partition!r}")
+        return image, partition
+    return partition, image
+
+
+def cmd_read(s: EdlSession, a):
+    lun, p = _detect(s, a.partition)
+    if s.fh.cmd_read(lun, p.sector, p.sectors, a.outfile):
+        print(f"[+] {a.partition}: {p.sectors} sectores (LBA {p.sector}, LUN {lun}) "
+              f"-> {a.outfile} | sha256 {sha256_file(a.outfile)[:16]}…")
+
+
+def cmd_read_lba(s: EdlSession, a):
+    if s.fh.cmd_read(a.lun, a.start, a.count, a.outfile):
+        print(f"[+] LUN {a.lun} LBA {a.start} (+{a.count}) -> {a.outfile} "
+              f"| sha256 {sha256_file(a.outfile)[:16]}…")
+
+
+def _backup_partition(s, lun, start, sectors, tag):
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(BACKUP_DIR, f"{tag}.{ts}.bin")
+    if not s.fh.cmd_read(lun, start, sectors, path):
+        sys.exit("[-] fallo el backup; aborto sin escribir.")
+    return path
+
+
+def _write_range(s, lun, start, image, tag, yes, force, allow_smaller,
+                 max_patches=DEFAULT_MAX_PATCHES):
+    ss = s.sector_size
+    img_len = len(image)
+    if img_len % ss:
+        sys.exit(f"[-] la imagen no es multiplo de {ss} bytes ({img_len}).")
+    img_sectors = img_len // ss
+    total = img_sectors
+    if is_danger(tag) and yes and not force:
+        sys.exit("[-] particion de arranque/modem/EFS: anade --force para admitir el riesgo.")
+    print(f"[*] rango: LUN {lun}, LBA inicial {start}, {total} sectores "
+          f"({human(img_len)}); comparando contra el flash…")
+
+    # 1) plan diff con lecturas en bloque (READ_CHUNK sectores/comando) + progreso
+    plan, changed, i = [], 0, 0
+    t0 = time.time()
+    while i < total:
+        n = min(READ_CHUNK, total - i)
+        rsp = s.fh.cmd_read_buffer(lun, start + i, n, display=False)
+        if not rsp.resp:
+            print()
+            sys.exit(f"[-] fallo lectura en LBA {start + i}: {rsp.error}")
+        blob = bytes(rsp.data)
+        for k in range(n):
+            old = blob[k * ss:(k + 1) * ss]
+            new = image[(i + k) * ss:(i + k + 1) * ss]
+            patches = plan_sector(old, new)
+            if patches is not None:
+                plan.append((start + i + k, patches))
+                changed += 1
+        i += n
+        print(f"\r    comparando… {100 * i // total:3d}% ({i}/{total} sectores)",
+              end="", flush=True)
+    print()
+    read_s = time.time() - t0
+    npatches = sum(len(p) for _, p in plan)
+    print(f"[*] plan: {changed}/{total} sectores difieren, {npatches} patches "
+          f"(lectura {read_s:.1f}s)")
+    if changed == 0:
+        print("[+] nada que hacer: el contenido ya es identico.")
+        return
+    eta_min = npatches / 200 / 60      # ~200 patches/s es una estimacion optimista
+    print(f"[*] estimacion: >= {eta_min:.0f} min de escritura solo si todo cambia "
+          f"(velocidad real depende del USB)")
+    bk = _backup_partition(s, lun, start, total, tag)
+    print(f"[+] backup previo: {bk} (sha256 {sha256_file(bk)[:16]}…)")
+
+    if not yes:
+        print("\n[DRY-RUN] no se escribio nada. Reejecuta con --yes para aplicar.\n"
+              f"    restauracion posterior: python3 partio.py restore-lba {lun} "
+              f"{start} {bk} --yes")
+        return
+
+    if npatches > max_patches:
+        sys.exit(f"[-] {npatches} patches superan el tope de seguridad --max-patches "
+                 f"({max_patches}). Una imagen casi entera distinta no es practica via "
+                 "patch (8B/comando). Sube el tope solo con conciencia del tiempo/riesgo, "
+                 "o reduce el cambio a una edicion quirurgica.")
+
+    # 2) escritura por patch, con un reintento; abort ordenado si hay NAK
+    print(f"[*] aplicando {npatches} patches…")
+    t0, sent, nak = time.time(), 0, 0
+    for abs_lba, patches in plan:
+        for off, size, val in patches:
+            ok = s.fh.cmd_patch(lun, abs_lba, off, val, size, display=False)
+            if not ok:
+                ok = s.fh.cmd_patch(lun, abs_lba, off, val, size, display=False)
+            if not ok:
+                nak += 1
+                print(f"\n[!!!] NAK en LBA {abs_lba} off {off} size {size}. "
+                      f"Restauro con: python3 partio.py restore-lba {lun} {start} {bk} --yes")
+                _write_manifest(tag, bk, lun, start, total, plan, sent, nak, aborted=True)
+                sys.exit(2)
+            sent += 1
+        if sent % 200 == 0:
+            print(f"    …{sent}/{npatches} patches")
+    write_s = time.time() - t0
+
+    # 3) verificacion de los sectores tocados
+    print("[*] verificando por relectura…")
+    bad = 0
+    for abs_lba, _ in plan:
+        i = abs_lba - start
+        rsp = s.fh.cmd_read_buffer(lun, abs_lba, 1, display=False)
+        if not rsp.resp or bytes(rsp.data) != image[i * ss:(i + 1) * ss]:
+            bad += 1
+    manifest = _write_manifest(tag, bk, lun, start, total, plan, sent, nak,
+                               aborted=False, bad=bad, write_s=write_s)
+    if bad:
+        print(f"[!!!] {bad} sectores no coinciden tras escribir; no reinicies y "
+              f"revisa {manifest}. Restauracion: restore-lba {lun} {start} {bk} --yes")
+        sys.exit(3)
+    print(f"[+] ESCRITURA OK: {sent} patches en {changed} sectores, {write_s:.1f}s "
+          f"({sent / max(write_s, 0.01):.0f} patches/s), verificacion byte a byte correcta.")
+    print(f"[+] manifiesto: {manifest}")
+    print(f"[+] restaurar si hace falta: python3 partio.py restore-lba {lun} {start} {bk} --yes")
+
+
+def _write_manifest(tag, backup, lun, start, sectors, plan, sent, nak, aborted, bad=0, write_s=0.0):
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(BACKUP_DIR, f"{tag}.{ts}.manifest.json")
+    with open(path, "w") as f:
+        json.dump({
+            "tag": tag, "backup": backup, "lun": lun, "start_lba": start,
+            "sectors": sectors, "changed_sectors": [lba for lba, _ in plan],
+            "patches_planned": sum(len(p) for _, p in plan), "patches_sent": sent,
+            "nak": nak, "verify_mismatches": bad, "aborted": aborted,
+            "write_seconds": round(write_s, 2),
+            "timestamp": ts,
+        }, f, indent=2)
+    return path
+
+
+def cmd_write(s: EdlSession, a):
+    a.partition, a.image = _resolve_part_image(a.partition, a.image)
+    lun, p = _detect(s, a.partition)
+    image = open(a.image, "rb").read()
+    cap = p.sectors * s.sector_size
+    if len(image) > cap:
+        sys.exit(f"[-] imagen ({human(len(image))}) mayor que la particion ({human(cap)}).")
+    if len(image) < cap and not a.allow_smaller:
+        sys.exit(f"[-] imagen mas pequena que la particion ({human(len(image))} < "
+                 f"{human(cap)}); usa --allow-smaller para escribir solo el prefijo.")
+    if is_danger(a.partition) and not a.force:
+        print(f"[!] AVISO: '{a.partition}' es particion de arranque/modem/EFS. "
+              "Con --force se admite el riesgo de brick.")
+    _write_range(s, lun, p.sector, image, a.partition, a.yes, a.force,
+                 a.allow_smaller, a.max_patches)
+
+
+def cmd_write_lba(s: EdlSession, a):
+    image = open(a.image, "rb").read()
+    _write_range(s, a.lun, a.start, image, f"lba{a.start}_lun{a.lun}",
+                 a.yes, force=True, allow_smaller=True, max_patches=a.max_patches)
+
+
+def cmd_restore(s: EdlSession, a):
+    a.partition, a.backup = _resolve_part_image(a.partition, a.backup)
+    lun, p = _detect(s, a.partition)
+    image = open(a.backup, "rb").read()
+    if len(image) != p.sectors * s.sector_size:
+        sys.exit("[-] el backup no coincide en tamano con la particion actual.")
+    a.allow_smaller = False
+    _write_range(s, lun, p.sector, image, f"restore_{a.partition}",
+                 a.yes, force=True, allow_smaller=False, max_patches=a.max_patches)
+
+
+def cmd_restore_lba(s: EdlSession, a):
+    image = open(a.backup, "rb").read()
+    _write_range(s, a.lun, a.start, image, f"restore_lba{a.start}_lun{a.lun}",
+                 a.yes, force=True, allow_smaller=True, max_patches=a.max_patches)
+
+
+def identify_magic(data: bytes):
+    """Identifica el contenido de un primer sector por sus firmas conocidas."""
+    if not data or len(data) < 512:
+        return "datos insuficientes"
+    if data[512:520] == b"EFI PART":
+        return "GPT (cabecera EFI en offset 512)"
+    if data[0:8] == b"ANDROID!":
+        return "Android boot image (ANDROID!)"
+    if data[0:4] == b"\x7fELF":
+        return "ELF (cadena de arranque: xbl/sbl/abl firmado)"
+    if data[0:4] == b"\x3a\xff\x26\xed":
+        return "Android sparse image"
+    if len(data) > 1028 and data[1024:1028] == (0xF2F52010).to_bytes(4, "little"):
+        return "F2FS"
+    if len(data) > 0x43A and data[0x438:0x43A] == (0xEF53).to_bytes(2, "little"):
+        return "ext4 (superblock)"
+    if data[510:512] == b"\x55\xaa":
+        return "MBR protector (55aa)"
+    if set(data) == {0}:
+        return "sector todo ceros (LU vacio o no mapeado)"
+    return "desconocido: " + data[:16].hex()
+
+
+def cmd_survey(s: EdlSession, a):
+    """Recorre en SOLO LECTURA los LUNs UFS y reporta GPT/magic de cada uno."""
+    print(f"[*] survey de LUNs 0..{a.max_lun} (solo lectura, no escribe nada)\n")
+    for lun in range(a.max_lun + 1):
+        print(f"--- LUN {lun} ---")
+        nparts = None
+        try:
+            _data, gpt = s.fh.get_gpt(lun, 0, 0, 0)
+            if gpt is not None and getattr(gpt, "partentries", None):
+                nparts = len(gpt.partentries)
+                names = list(gpt.partentries)[:12]
+                print(f"    GPT: {nparts} particiones; ejemplos: {', '.join(names)}"
+                      + (" …" if len(gpt.partentries) > 12 else ""))
+            else:
+                print("    GPT: ninguna (esperable en Boot LUs / RPMB)")
+        except Exception as e:  # pylint: disable=broad-except
+            print(f"    GPT: no legible ({type(e).__name__}: {e})")
+        try:
+            rsp = s.fh.cmd_read_buffer(lun, 0, 1, display=False)
+            if rsp.resp:
+                print(f"    LBA0: {identify_magic(bytes(rsp.data))}")
+            else:
+                print(f"    LBA0: lectura rechazada ({rsp.error}) "
+                      "-> posible LU protegido (p.ej. RPMB)")
+        except Exception as e:  # pylint: disable=broad-except
+            print(f"    LBA0: error de lectura ({type(e).__name__}: {e})")
+        print()
+    print("[*] sugerencia: los LUN sin GPT suelen ser UFS Boot LU (xbl) o RPMB;")
+    print("    el comportamiento de lectura de RPMB es en si mismo un resultado a documentar.")
+
+
+def _device_digest(s: EdlSession, lun, lba, sectors):
+    """SHA-256 calculado por el loader (getsha256digest); tolera list/str."""
+    res = s.fh.cmd_getsha256digest(lun, lba, sectors)
+    if not res:
+        return None
+    text = "\n".join(map(str, res)) if isinstance(res, (list, tuple)) else str(res)
+    m = re.search(r"[0-9a-fA-F]{64}", text)
+    return m.group(0).lower() if m else None
+
+
+def cmd_zmap(s: EdlSession, a):
+    """Clasifica particiones en VACIO/CON DATOS usando digest on-device (sin volcar)."""
+    _data, gpt = s.fh.get_gpt(a.lun, 0, 0, 0)
+    if gpt is None:
+        sys.exit(f"[-] no se pudo leer la GPT del LUN {a.lun}")
+    cap = a.max_mib * 1024 * 1024
+    print(f"{'particion':<22}{'LBA':>11}{'sectores':>11}{'tamano':>10}  estado")
+    vacias, con_datos, omitidas, fallos = [], [], [], []
+    for name, p in sorted(gpt.partentries.items(), key=lambda kv: kv[1].sector):
+        size = p.sectors * s.sector_size
+        if size > cap and not a.all:
+            print(f"{name:<22}{p.sector:>11}{p.sectors:>11}{human(size):>10}  omitido (> {a.max_mib} MiB; usa --all)")
+            omitidas.append(name)
+            continue
+        try:
+            digest = _device_digest(s, a.lun, p.sector, p.sectors)
+            if digest is None:
+                raise RuntimeError("digest no soportado/vacio")
+            zero = hashlib.sha256(b"\x00" * size).hexdigest()
+            if digest == zero:
+                estado = "VACIO (ceros)"
+                vacias.append(name)
+            else:
+                estado = "CON DATOS"
+                con_datos.append(name)
+        except Exception as e:  # pylint: disable=broad-except
+            estado = f"error: {type(e).__name__}"
+            fallos.append(name)
+        print(f"{name:<22}{p.sector:>11}{p.sectors:>11}{human(size):>10}  {estado}")
+    print(f"\n[*] resumen LUN {a.lun}: {len(vacias)} vacias, {len(con_datos)} con datos, "
+          f"{len(omitidas)} omitidas, {len(fallos)} con error")
+    if vacias:
+        print("    vacias: " + ", ".join(vacias))
+    if con_datos:
+        print("    con datos: " + ", ".join(con_datos))
+    print("\n[i] una particion de identidad/TEE en ceros es normal (estado en TEE/RPMB);")
+    print("    si 'param', 'misc', 'persist' o 'modemst1' tambien salen vacias, revisa el LUN.")
+
+
+def _lun_total_sectors(s: EdlSession, lun):
+    """Lee los 2 primeros sectores del LUN y obtiene el tamano de la cabecera GPT.
+
+    Layout estandar: LBA0 = MBR protector, LBA1 = cabecera GPT ('EFI PART' en el
+    inicio del segundo sector); backup_lba es el qword en offset 32 de la cabecera.
+    Devuelve (total_sectors, backup_lba) o (None, None) si el LUN es imagen cruda.
+    """
+    rsp = s.fh.cmd_read_buffer(lun, 0, 2, display=False)
+    if not rsp.resp or len(rsp.data) < 2 * s.sector_size:
+        return None, None
+    data = bytes(rsp.data)
+    ss = s.sector_size
+    if data[ss:ss + 8] != b"EFI PART":
+        return None, None
+    # cabecera GPT en LBA1: signature(8) revision(4) hsize(4) crc(4) reserved(4)
+    # currentLBA(8) -> backupLBA(8) en el offset 32 de la cabecera
+    backup_lba = struct.unpack("<Q", data[ss + 32:ss + 40])[0]
+    if backup_lba == 0 or backup_lba > (1 << 40):
+        return None, None
+    return backup_lba + 1, backup_lba
+
+
+def cmd_backup_luns(s: EdlSession, a):
+    """Respalda LUNs completos deduciendo el tamano de la GPT (sin placeholders)."""
+    luns = [int(x) for x in a.luns.split(",") if x != ""]
+    os.makedirs(a.outdir, exist_ok=True)
+    manifest = []
+    for lun in luns:
+        total, backup_lba = _lun_total_sectors(s, lun)
+        if total is None:
+            print(f"LUN {lun}: sin GPT valida (LU crudo, p.ej. Boot LU). El tamano hay "
+                  "que sacarlo de rawprogramN.xml (suma de num_partition_sectors).")
+            manifest.append({"lun": lun, "status": "no-gpt"})
+            continue
+        print(f"LUN {lun}: {total} sectores ({human(total * s.sector_size)}), "
+              f"backup_lba={backup_lba}")
+        if a.info_only:
+            manifest.append({"lun": lun, "status": "info", "sectors": total})
+            continue
+        fn = os.path.join(a.outdir, f"lun{lun}_full.bin")
+        if os.path.exists(fn) and not a.overwrite:
+            print(f"    ya existe {fn}; usa --overwrite para rehacerlo")
+            manifest.append({"lun": lun, "status": "exists", "file": fn})
+            continue
+        if not s.fh.cmd_read(lun, 0, total, fn):
+            print(f"    [-] fallo la lectura del LUN {lun}")
+            manifest.append({"lun": lun, "status": "read-error"})
+            continue
+        digest = sha256_file(fn)
+        print(f"    [+] {fn} | sha256 {digest[:16]}…")
+        manifest.append({"lun": lun, "status": "ok", "sectors": total,
+                         "file": fn, "sha256": digest})
+    mp = os.path.join(a.outdir, "backup_luns.manifest.json")
+    with open(mp, "w") as f:
+        json.dump(manifest, f, indent=2)
+    print(f"\n[*] manifiesto: {mp}")
+    sin_gpt = [m["lun"] for m in manifest if m["status"] == "no-gpt"]
+    if sin_gpt:
+        print("[i] LUNs sin GPT:", sin_gpt, "- su tamano exacto sale de los XML del paquete.")
+
+
+def cmd_digest(s: EdlSession, a):
+    if getattr(a, "partition", None):
+        lun, p = _detect(s, a.partition)
+        lba, sectors = p.sector, p.sectors
+        print(f"[*] digest on-device de {a.partition} (LUN {lun}, LBA {lba}, {sectors} sectores)")
+    else:
+        lun, lba, sectors = a.lun, a.start, a.count
+        print(f"[*] digest on-device de LUN {lun} LBA {lba} (+{sectors})")
+    dev = _device_digest(s, lun, lba, sectors)
+    if not dev:
+        sys.exit("[-] el loader no devolvio un digest valido (funcion no soportada?)")
+    print(f"    dispositivo : {dev}")
+    if a.file and os.path.isfile(a.file):
+        loc = sha256_file(a.file)
+        print(f"    archivo local: {loc}")
+        print("    [+] COINCIDEN: la lectura es byte a byte fiel al flash."
+              if dev == loc else "    [!!!] DIFIEREN: la lectura no es fiable, reintenta.")
+    else:
+        zero = hashlib.sha256(b"\x00" * (sectors * s.sector_size)).hexdigest()
+        if dev == zero:
+            print("    [i] el digest es el de una region TODO CEROS de ese tamano.")
+
+
+def _hexdump(data, base=0):
+    for i in range(0, len(data), 16):
+        chunk = data[i:i + 16]
+        hexs = " ".join(f"{b:02x}" for b in chunk)
+        asc = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+        print(f"{base + i:08x}  {hexs:<47}  {asc}")
+
+
+def cmd_peek(s: EdlSession, a):
+    lun, p = _detect(s, a.partition)
+    if a.offset + a.length > s.sector_size:
+        sys.exit(f"[-] en v1 el rango debe caber en un sector ({s.sector_size} bytes).")
+    rsp = s.fh.cmd_read_buffer(lun, p.sector + a.offset // s.sector_size, 1, display=False)
+    if not rsp.resp:
+        sys.exit(f"[-] lectura fallida: {rsp.error}")
+    off = a.offset % s.sector_size
+    _hexdump(bytes(rsp.data)[off:off + a.length], base=a.offset)
+
+
+def cmd_poke(s: EdlSession, a):
+    lun, p = _detect(s, a.partition)
+    try:
+        data = binascii.unhexlify(a.hex.replace(" ", "").replace("0x", ""))
+    except binascii.Error:
+        sys.exit("[-] hex invalido (ej: 4e4f o '4e 4f').")
+    if not data or len(data) > MAX_PATCH * 32:
+        sys.exit(f"[-] longitud invalida (1..{MAX_PATCH * 32} bytes).")
+    sector_idx = a.offset // s.sector_size
+    off = a.offset % s.sector_size
+    if off + len(data) > s.sector_size:
+        sys.exit("[-] el rango cruza el borde del sector; alinea o usa write.")
+    abs_lba = p.sector + sector_idx
+    rsp = s.fh.cmd_read_buffer(lun, abs_lba, 1, display=False)
+    if not rsp.resp:
+        sys.exit(f"[-] lectura fallida: {rsp.error}")
+    old = bytes(rsp.data)
+    new = old[:off] + data + old[off + len(data):]
+    patches = plan_sector(old, new)
+    bk = _backup_partition(s, lun, abs_lba, 1, f"poke_{a.partition}_lba{abs_lba}")
+    print(f"[*] {len(patches)} patches en LBA {abs_lba}, backup del sector: {bk}")
+    if not a.yes:
+        print("[DRY-RUN] reejecuta con --yes para escribir.")
+        return
+    for poff, size, val in patches:
+        if not s.fh.cmd_patch(lun, abs_lba, poff, val, size, display=False):
+            sys.exit("[!!!] NAK; el backup del sector esta intacto y disponible.")
+    chk = s.fh.cmd_read_buffer(lun, abs_lba, 1, display=False)
+    assert bytes(chk.data) == new, "verificacion fallida"
+    print("[+] poke verificado por relectura.")
+
+
+# ---------------------------------------------------------------- CLI
+def build_parser():
+    ap = argparse.ArgumentParser(description="RW de particiones firehose (sesion unica)")
+    ap.add_argument("--edl-dir", default=os.environ.get("EDL_DIR", "."),
+                    help="carpeta del repo edl (donde vive edl.py)")
+    ap.add_argument("--loader", required=True)
+    ap.add_argument("--memory", default="ufs")
+    ap.add_argument("--debug", action="store_true")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("info")
+
+    sp = sub.add_parser("survey"); sp.add_argument("--max-lun", type=int, default=5)
+
+    sp = sub.add_parser("parts"); sp.add_argument("--lun", type=int, default=0)
+
+    sp = sub.add_parser("zmap")
+    sp.add_argument("--lun", type=int, default=0)
+    sp.add_argument("--all", action="store_true", help="incluye particiones grandes")
+    sp.add_argument("--max-mib", type=int, default=32)
+
+    sp = sub.add_parser("backup-luns")
+    sp.add_argument("luns", help="lista separada por comas, p.ej. 1,2,3,4,5")
+    sp.add_argument("outdir")
+    sp.add_argument("--info-only", action="store_true", help="solo tamaños, no vuelca")
+    sp.add_argument("--overwrite", action="store_true")
+
+    sp = sub.add_parser("digest"); sp.add_argument("partition"); sp.add_argument("file", nargs="?")
+    sp = sub.add_parser("digest-lba")
+    sp.add_argument("lun", type=int); sp.add_argument("start", type=lambda x: int(x, 0))
+    sp.add_argument("count", type=int); sp.add_argument("file", nargs="?")
+
+    sp = sub.add_parser("read"); sp.add_argument("partition"); sp.add_argument("outfile")
+
+    sp = sub.add_parser("read-lba")
+    sp.add_argument("lun", type=int); sp.add_argument("start", type=lambda x: int(x, 0))
+    sp.add_argument("count", type=int); sp.add_argument("outfile")
+
+    def w_args(sp):
+        sp.add_argument("--yes", action="store_true", help="sin esto, solo dry-run + backup")
+        sp.add_argument("--force", action="store_true", help="admite riesgo en particiones criticas")
+        sp.add_argument("--allow-smaller", action="store_true")
+        sp.add_argument("--max-patches", type=int, default=DEFAULT_MAX_PATCHES,
+                        help=f"tope de patches por trabajo (default {DEFAULT_MAX_PATCHES})")
+
+    sp = sub.add_parser("write"); sp.add_argument("partition"); sp.add_argument("image"); w_args(sp)
+    sp = sub.add_parser("write-lba")
+    sp.add_argument("lun", type=int); sp.add_argument("start", type=lambda x: int(x, 0))
+    sp.add_argument("image"); w_args(sp)
+    sp = sub.add_parser("restore"); sp.add_argument("partition"); sp.add_argument("backup"); w_args(sp)
+    sp = sub.add_parser("restore-lba")
+    sp.add_argument("lun", type=int); sp.add_argument("start", type=lambda x: int(x, 0))
+    sp.add_argument("backup"); w_args(sp)
+
+    sp = sub.add_parser("peek"); sp.add_argument("partition")
+    sp.add_argument("offset", type=lambda x: int(x, 0)); sp.add_argument("length", type=int)
+
+    sp = sub.add_parser("poke"); sp.add_argument("partition")
+    sp.add_argument("offset", type=lambda x: int(x, 0)); sp.add_argument("hex"); w_args(sp)
+    return ap
+
+
+DISPATCH = {
+    "info": cmd_info, "survey": cmd_survey, "zmap": cmd_zmap, "parts": cmd_parts,
+    "backup-luns": cmd_backup_luns,
+    "digest": cmd_digest, "digest-lba": cmd_digest,
+    "read": cmd_read, "read-lba": cmd_read_lba,
+    "write": cmd_write, "write-lba": cmd_write_lba, "restore": cmd_restore,
+    "restore-lba": cmd_restore_lba, "peek": cmd_peek, "poke": cmd_poke,
+}
+
+
+def main():
+    a = build_parser().parse_args()
+    lun = getattr(a, "lun", 0) or 0
+    with EdlSession(a.edl_dir, a.loader, a.memory, lun, a.debug) as s:
+        DISPATCH[a.cmd](s, a)
+
+
+if __name__ == "__main__":
+    main()
